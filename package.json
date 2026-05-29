@@ -1,0 +1,17 @@
+{
+  "name": "@washogren/am-consumer",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Example consumer of @washogren/am-dependency. Demonstrates dist-tag tracking via the GHA shim.",
+  "main": "src/index.js",
+  "bin": {
+    "am-consumer": "bin/cli.js"
+  },
+  "scripts": {
+    "start": "node bin/cli.js",
+    "test": "node src/index.test.js"
+  },
+  "dependencies": {
+    "@washogren/am-dependency": "1.0.0-prod.1"
+  }
+}
