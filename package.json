@@ -4,6 +4,9 @@
   "private": true,
   "description": "Example consumer of @washogren/am-dependency. Demonstrates dist-tag tracking via the GHA shim.",
   "main": "src/index.js",
+  "publishConfig": {
+    "registry": "https://npm.pkg.github.com"
+  },
   "bin": {
     "am-consumer": "bin/cli.js"
   },
