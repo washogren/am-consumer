@@ -39,7 +39,7 @@ jobs:
         run: |
           PACKAGE="@washogren/am-dependency"
           CURRENT=$(node -p "require('./package.json').dependencies['${PACKAGE}']")
-          LATEST=$(npm view "${PACKAGE}" "dist-tags.${{ matrix.tag }}")
+          LATEST=$(npm dist-tag ls "${PACKAGE}" | awk -F': ' -v tag="${{ matrix.tag }}" '$1 == tag {print $2}')
 
           if [ -z "$LATEST" ]; then
             echo "Tag '${{ matrix.tag }}' not found on ${PACKAGE}. Skipping."
@@ -75,4 +75,4 @@ jobs:
             Previous:   `${{ steps.bump.outputs.current }}`
             New:        `${{ steps.bump.outputs.latest }}`
 
-            Resolved from `npm view @washogren/am-dependency dist-tags.${{ matrix.tag }}`.
+            Resolved from `npm dist-tag ls @washogren/am-dependency`.
