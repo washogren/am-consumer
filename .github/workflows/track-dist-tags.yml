@@ -62,6 +62,7 @@ jobs:
         if: steps.bump.outputs.changed == 'true'
         uses: peter-evans/create-pull-request@v6
         with:
+          token: ${{ secrets.GH_PACKAGES_READ }}
           base: ${{ matrix.branch }}
           branch: auto-update/am-dependency-${{ matrix.tag }}
           delete-branch: true
