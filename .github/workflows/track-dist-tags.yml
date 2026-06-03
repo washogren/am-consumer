@@ -153,21 +153,6 @@ jobs:
             fi
           done < "${ENRICHED}"
 
-          truncate_body() {
-            local input="$1"
-            local max=1500
-            if [ "${#input}" -gt "${max}" ]; then
-              echo "${input:0:${max}}…"
-            else
-              echo "${input}"
-            fi
-          }
-
-          quote_block() {
-            # Prefix every line with "> " so the block renders as a markdown blockquote.
-            sed 's/^/> /; s/^> $/>/'
-          }
-
           for NUM in "${PR_ORDER[@]}"; do
             pr="${PR_JSON[${NUM}]}"
             TITLE=$(jq -r '.title' <<<"${pr}")
@@ -177,12 +162,21 @@ jobs:
               echo ""
               echo "### [#${NUM}](${URL}) — ${TITLE}"
               echo ""
+              echo "<details>"
+              echo "<summary>Commits and description</summary>"
+              echo ""
+              echo "**Commits:**"
+              echo ""
+              printf '%s' "${PR_COMMITS[${NUM}]}"
               if [ -n "${PR_BODY}" ]; then
-                truncate_body "${PR_BODY}" | quote_block
+                echo ""
+                echo "**Description:**"
+                echo ""
+                # Full PR body, no truncation. Indent inside <details> renders as-is on GitHub.
+                echo "${PR_BODY}"
                 echo ""
               fi
-              echo "Commits:"
-              printf '%s' "${PR_COMMITS[${NUM}]}"
+              echo "</details>"
             } >> "${BODY}"
           done
 
@@ -200,11 +194,16 @@ jobs:
               REST=$(echo "${MSG}" | tail -n +3)
               {
                 echo "#### [\`${SHORT}\`](${REPO_URL}/commit/${SHA}) — ${SUBJECT}"
-                echo ""
                 if [ -n "${REST}" ]; then
-                  truncate_body "${REST}" | quote_block
                   echo ""
+                  echo "<details>"
+                  echo "<summary>Description</summary>"
+                  echo ""
+                  echo "${REST}"
+                  echo ""
+                  echo "</details>"
                 fi
+                echo ""
               } >> "${BODY}"
             done
           fi
