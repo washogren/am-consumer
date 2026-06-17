@@ -15,6 +15,6 @@
     "test": "node src/index.test.js"
   },
   "dependencies": {
-    "@washogren/am-dependency": "1.1.17-dev.29"
+    "@washogren/am-dependency": "1.1.21-dev.33"
   }
 }
