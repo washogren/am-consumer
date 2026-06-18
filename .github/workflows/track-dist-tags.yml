@@ -32,4 +32,4 @@ jobs:
           tag: ${{ matrix.tag }}
           base-branch: ${{ matrix.branch }}
           npm-scope: '@washogren'
-          token: ${{ secrets.GH_PACKAGES_READ }}
+          token: ${{ secrets.E2E_TOKEN }}
