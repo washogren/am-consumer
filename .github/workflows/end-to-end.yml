@@ -1,0 +1,47 @@
+name: End-to-end (consumer)
+
+# Runs the auto-update-dependencies action against an arbitrary ref of the
+# action source (default: v1). Used by the action's PR pipeline to dogfood
+# unmerged changes before they hit v1, but also dispatchable manually.
+#
+# Unlike track-dist-tags.yml (the cron path that pins to @v1), this workflow
+# checks out the action source into ./action and runs it as a local action
+# so we can target arbitrary commits — `uses:` cannot interpolate refs.
+
+on:
+  workflow_dispatch:
+    inputs:
+      action-ref:
+        description: Ref of washogren/auto-update-dependencies to test (branch, tag, or SHA).
+        required: false
+        default: v1
+
+concurrency:
+  group: end-to-end
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: dev
+
+      - name: Checkout action source at requested ref
+        uses: actions/checkout@v4
+        with:
+          repository: washogren/auto-update-dependencies
+          ref: ${{ inputs.action-ref }}
+          path: action
+
+      - uses: ./action
+        with:
+          package: '@washogren/am-dependency'
+          tag: dev
+          base-branch: dev
+          npm-scope: '@washogren'
+          token: ${{ secrets.E2E_TOKEN }}
