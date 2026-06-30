@@ -15,6 +15,6 @@
     "test": "node src/index.test.js"
   },
   "dependencies": {
-    "@washogren/am-dependency": "1.1.73-dev.87"
+    "@washogren/am-dependency": "1.1.77-dev.91"
   }
 }
