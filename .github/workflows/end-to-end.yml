@@ -333,11 +333,14 @@ jobs:
           done
           STATE=$(gh pr view "$PR_NUMBER" --json state --jq '.state')
           [ "$STATE" = "MERGED" ] || { echo "::error::PR #$PR_NUMBER never merged (state=$STATE)" >&2; exit 1; }
-          BRANCH="auto-update/washogren-am-dependency-e2e-patch"
-          if git ls-remote --exit-code --heads origin "$BRANCH" >/dev/null 2>&1; then
-            echo "::error::delete-branch did not remove $BRANCH" >&2; exit 1
-          fi
-          echo "head branch deleted"
+
+          # Deliberately NOT asserting the head branch was deleted here.
+          # peter-evans' `delete-branch` removes the branch when the ACTION
+          # closes a PR (e.g. undoing a bump) — not when GitHub merges one.
+          # Deletion on merge is the repo's delete_branch_on_merge setting, so
+          # asserting it here would test a repo setting while blaming an action
+          # input. The leftover branch is harmless: Phase 0 of the next run
+          # deletes every auto-update/* branch before anything else happens.
 
       # --- minor: must stay OPEN once its checks are green ---
       - name: Assert auto-merge was withheld and the PR stays open
