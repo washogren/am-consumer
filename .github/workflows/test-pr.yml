@@ -26,8 +26,12 @@ jobs:
         env:
           NODE_AUTH_TOKEN: ${{ secrets.GH_PACKAGES_READ }}
         run: |
-          export npm_config_@washogren:registry="https://npm.pkg.github.com"
-          export npm_config_//npm.pkg.github.com/:_authToken="$NODE_AUTH_TOKEN"
+          # Written by hand rather than by setup-node so ONLY the scope is bound,
+          # never a global default. These keys cannot go through `export` — `@`
+          # and `:` are not valid in a shell identifier — so .npmrc is how bash
+          # expresses them. (.npmrc is gitignored; this file is runner-local.)
+          printf '@washogren:registry=https://npm.pkg.github.com\n' > .npmrc
+          printf '//npm.pkg.github.com/:_authToken=%s\n' "$NODE_AUTH_TOKEN" >> .npmrc
           npm ci
 
       - name: Run tests

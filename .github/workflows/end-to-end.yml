@@ -109,8 +109,12 @@ jobs:
           NODE_AUTH_TOKEN: ${{ secrets.E2E_TOKEN }}
         run: |
           # Scope-bound, never a global default — same rule the action follows.
-          export npm_config_@washogren:registry="$REGISTRY"
-          export npm_config_//npm.pkg.github.com/:_authToken="$NODE_AUTH_TOKEN"
+          # Scope-bound only, never a global default — a global default makes the
+          # private registry authoritative for every package, so public deps 404.
+          # These keys are not valid shell identifiers (`@`, `:`, `/`), so they go
+          # in .npmrc rather than through `export`.
+          printf '@washogren:registry=%s\n' "$REGISTRY" > .npmrc
+          printf '//npm.pkg.github.com/:_authToken=%s\n' "$NODE_AUTH_TOKEN" >> .npmrc
           TAGS=$(npm dist-tag ls "$PACKAGE")
           echo "$TAGS"
 
@@ -161,8 +165,12 @@ jobs:
         run: |
           # Bind ONLY the scope to the private registry, exactly as the action
           # does, so the public `ms` dependency still resolves from npmjs.org.
-          export npm_config_@washogren:registry="$REGISTRY"
-          export npm_config_//npm.pkg.github.com/:_authToken="$NODE_AUTH_TOKEN"
+          # Scope-bound only, never a global default — a global default makes the
+          # private registry authoritative for every package, so public deps 404.
+          # These keys are not valid shell identifiers (`@`, `:`, `/`), so they go
+          # in .npmrc rather than through `export`.
+          printf '@washogren:registry=%s\n' "$REGISTRY" > .npmrc
+          printf '//npm.pkg.github.com/:_authToken=%s\n' "$NODE_AUTH_TOKEN" >> .npmrc
 
           # DELETE then CREATE, rather than force-update.
           #
@@ -450,8 +458,12 @@ jobs:
         env:
           NODE_AUTH_TOKEN: ${{ secrets.E2E_TOKEN }}
         run: |
-          export npm_config_@washogren:registry="$REGISTRY"
-          export npm_config_//npm.pkg.github.com/:_authToken="$NODE_AUTH_TOKEN"
+          # Scope-bound only, never a global default — a global default makes the
+          # private registry authoritative for every package, so public deps 404.
+          # These keys are not valid shell identifiers (`@`, `:`, `/`), so they go
+          # in .npmrc rather than through `export`.
+          printf '@washogren:registry=%s\n' "$REGISTRY" > .npmrc
+          printf '//npm.pkg.github.com/:_authToken=%s\n' "$NODE_AUTH_TOKEN" >> .npmrc
           npm dist-tag add "$PACKAGE@$LATEST" e2e-update
           npm dist-tag ls "$PACKAGE" | grep '^e2e-update:'
 
