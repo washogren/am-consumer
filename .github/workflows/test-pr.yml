@@ -14,16 +14,25 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Deliberately NO registry-url/scope here. setup-node would write a bare
+      # `registry=` default into .npmrc, making GitHub Packages the global
+      # default for EVERY package — so public dependencies 404. Bind only the
+      # scope below, which is the same rule the action itself follows.
       - uses: actions/setup-node@v4
         with:
           node-version: 20
-          registry-url: https://npm.pkg.github.com
-          scope: "@washogren"
 
       - name: Install dependencies
         env:
           NODE_AUTH_TOKEN: ${{ secrets.GH_PACKAGES_READ }}
-        run: npm ci
+        run: |
+          # Written by hand rather than by setup-node so ONLY the scope is bound,
+          # never a global default. These keys cannot go through `export` — `@`
+          # and `:` are not valid in a shell identifier — so .npmrc is how bash
+          # expresses them. (.npmrc is gitignored; this file is runner-local.)
+          printf '@washogren:registry=https://npm.pkg.github.com\n' > .npmrc
+          printf '//npm.pkg.github.com/:_authToken=%s\n' "$NODE_AUTH_TOKEN" >> .npmrc
+          npm ci
 
       - name: Run tests
         id: test

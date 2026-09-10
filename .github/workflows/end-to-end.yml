@@ -1,12 +1,24 @@
 name: End-to-end (consumer)
 
-# Runs the auto-update-dependencies action against an arbitrary ref of the
-# action source (default: v1). Used by the action's PR pipeline to dogfood
-# unmerged changes before they hit v1, but also dispatchable manually.
+# Proves that auto-update-dependencies routes every bump classification
+# correctly, end-to-end, against a real registry and real pull requests.
 #
-# Unlike track-dist-tags.yml (the cron path that pins to @v1), this workflow
-# checks out the action source into ./action and runs it as a local action
-# so we can target arbitrary commits — `uses:` cannot interpolate refs.
+# Five tiers run the action with BYTE-IDENTICAL configuration. The outcome falls
+# out of each branch's pinned version alone, which is what makes this a test of
+# the classifier and the two semver gates rather than a test of five hand-written
+# configs:
+#
+#   tier       pinned at   resolves to   classifies   expected outcome
+#   ---------  ----------  ------------  -----------  ----------------------------
+#   patch      M.1.0       M.1.1         patch        PR opens, auto-merges itself
+#   minor      M.0.0       M.1.1         minor        PR opens, stays open
+#   update     M.0.0       M.1.0->M.1.1  minor x2     ONE PR, created then updated
+#   major      baseline    M.1.1         major        no PR at all
+#   nochange   M.1.1       M.1.1         --           changed=false, nothing done
+#
+# Each of the two semver gates is straddled by a pair — one tier it admits and
+# one it rejects. A single sample cannot distinguish a working gate from one
+# stuck open, which is why the tiers come in pairs rather than one per feature.
 
 on:
   workflow_dispatch:
@@ -14,34 +26,528 @@ on:
       action-ref:
         description: Ref of washogren/auto-update-dependencies to test (branch, tag, or SHA).
         required: false
-        default: v1
+        default: v2
 
 concurrency:
-  group: end-to-end
+  group: e2e-consumer
   cancel-in-progress: false
 
+env:
+  PACKAGE: '@washogren/am-dependency'
+  SCOPE: '@washogren'
+  REGISTRY: 'https://npm.pkg.github.com'
+
 jobs:
-  update:
+  # ---------------------------------------------------------------------------
+  # Phase 0 + seed. Everything a previous run could have left behind is cleared
+  # here, unconditionally — a cancelled run never reaches a cleanup step of its
+  # own, so the reset has to live at the START of the next run.
+  # ---------------------------------------------------------------------------
+  reset:
     runs-on: ubuntu-latest
     permissions:
       contents: write
       pull-requests: write
+    env:
+      GH_TOKEN: ${{ secrets.E2E_TOKEN }}
+    outputs:
+      latest: ${{ steps.versions.outputs.latest }}
+      patch_base: ${{ steps.versions.outputs.patch_base }}
+      minor_base: ${{ steps.versions.outputs.minor_base }}
+      major_base: ${{ steps.versions.outputs.major_base }}
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: dev
+          ref: master
+          fetch-depth: 0
+          token: ${{ secrets.E2E_TOKEN }}
 
-      - name: Checkout action source at requested ref
+      # Deliberately NO registry-url here. setup-node would write a bare
+      # `registry=` default into .npmrc, making the private registry the global
+      # default so public deps 404. Only the scope is bound, below.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Configure git author
+        run: |
+          git config user.email "actions@github.com"
+          git config user.name "github-actions[bot]"
+
+      - name: Phase 0 — clear anything a previous run left behind
+        run: |
+          echo "closing open auto-update PRs..."
+          for N in $(gh pr list --state open --json number,headRefName \
+                       --jq '.[] | select(.headRefName | startswith("auto-update/")) | .number'); do
+            echo "  closing #$N"
+            gh pr close "$N" --delete-branch || true
+          done
+
+          echo "deleting any surviving auto-update branches..."
+          for B in $(git ls-remote --heads origin 'refs/heads/auto-update/*' | awk '{print $2}' | sed 's|refs/heads/||'); do
+            echo "  deleting $B"
+            git push origin --delete "$B" || true
+          done
+          echo "phase 0 complete (finding nothing is success)"
+
+      - name: Assert phase 0 actually cleared everything
+        run: |
+          LEFT=$(gh pr list --state open --json headRefName \
+                   --jq '[.[] | select(.headRefName | startswith("auto-update/"))] | length')
+          BRANCHES=$(git ls-remote --heads origin 'refs/heads/auto-update/*' | wc -l | tr -d ' ')
+          echo "remaining auto-update PRs=$LEFT branches=$BRANCHES"
+          if [ "$LEFT" != "0" ] || [ "$BRANCHES" != "0" ]; then
+            echo "::error::phase 0 could not clear prior state; failing here rather than blaming a tier later" >&2
+            exit 1
+          fi
+
+      # Every version this run needs is derivable from one dist-tag read, because
+      # a run publishes exactly M.0.0 / M.1.0 / M.1.1 and nothing else.
+      - name: Resolve the version plan from the dist-tags
+        id: versions
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.E2E_TOKEN }}
+        run: |
+          # Scope-bound, never a global default — same rule the action follows.
+          # Scope-bound only, never a global default — a global default makes the
+          # private registry authoritative for every package, so public deps 404.
+          # These keys are not valid shell identifiers (`@`, `:`, `/`), so they go
+          # in .npmrc rather than through `export`.
+          printf '@washogren:registry=%s\n' "$REGISTRY" > .npmrc
+          printf '//npm.pkg.github.com/:_authToken=%s\n' "$NODE_AUTH_TOKEN" >> .npmrc
+          TAGS=$(npm dist-tag ls "$PACKAGE")
+          echo "$TAGS"
+
+          LATEST=$(echo "$TAGS" | sed -n 's/^e2e-patch: //p')
+          UPDATE=$(echo "$TAGS" | sed -n 's/^e2e-update: //p')
+          MAJOR_BASE=$(echo "$TAGS" | sed -n 's/^e2e-major-baseline: //p')
+
+          if [ -z "$LATEST" ] || [ -z "$UPDATE" ] || [ -z "$MAJOR_BASE" ]; then
+            echo "::error::missing a required dist-tag (e2e-patch=$LATEST e2e-update=$UPDATE e2e-major-baseline=$MAJOR_BASE)" >&2
+            exit 1
+          fi
+
+          M=${LATEST%%.*}
+          PATCH_BASE="${M}.1.0"
+          MINOR_BASE="${M}.0.0"
+
+          # The update tier's tag must start one version back; if it does not,
+          # the publish run did not finish the way this workflow assumes.
+          if [ "$UPDATE" != "$PATCH_BASE" ]; then
+            echo "::error::e2e-update is '$UPDATE', expected '$PATCH_BASE'" >&2
+            exit 1
+          fi
+          # The major baseline must be a strictly lower major, or the major tier
+          # would not classify as a major bump.
+          if [ "${MAJOR_BASE%%.*}" -ge "$M" ]; then
+            echo "::error::e2e-major-baseline '$MAJOR_BASE' is not below major $M" >&2
+            exit 1
+          fi
+
+          {
+            echo "latest=$LATEST"
+            echo "patch_base=$PATCH_BASE"
+            echo "minor_base=$MINOR_BASE"
+            echo "major_base=$MAJOR_BASE"
+          } >> "$GITHUB_OUTPUT"
+
+          echo "run major=$M  latest=$LATEST  patch=$PATCH_BASE  minor=$MINOR_BASE  major=$MAJOR_BASE"
+
+      # Recreating each branch from master IS the reset — no cleanup of the
+      # previous run's merges is needed because none of that history survives.
+      - name: Seed the five tier branches
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.E2E_TOKEN }}
+          LATEST: ${{ steps.versions.outputs.latest }}
+          PATCH_BASE: ${{ steps.versions.outputs.patch_base }}
+          MINOR_BASE: ${{ steps.versions.outputs.minor_base }}
+          MAJOR_BASE: ${{ steps.versions.outputs.major_base }}
+        run: |
+          # Bind ONLY the scope to the private registry, exactly as the action
+          # does, so the public `ms` dependency still resolves from npmjs.org.
+          # Scope-bound only, never a global default — a global default makes the
+          # private registry authoritative for every package, so public deps 404.
+          # These keys are not valid shell identifiers (`@`, `:`, `/`), so they go
+          # in .npmrc rather than through `export`.
+          printf '@washogren:registry=%s\n' "$REGISTRY" > .npmrc
+          printf '//npm.pkg.github.com/:_authToken=%s\n' "$NODE_AUTH_TOKEN" >> .npmrc
+
+          # DELETE then CREATE, rather than force-update.
+          #
+          # The protect-e2e ruleset requires the `test` check on refs/heads/e2e/*
+          # so that auto-merge has something to wait on — without a pending
+          # required check, GitHub refuses `gh pr merge --auto` outright because
+          # the PR is already mergeable. That same rule blocks a direct UPDATE to
+          # the branch, but its do_not_enforce_on_create parameter exempts a
+          # CREATE. Verified empirically against this repo: create is allowed,
+          # update is rejected with "push declined due to repository rule
+          # violations".
+          #
+          # Deleting first therefore lets the harness seed with NO bypass actor
+          # on the ruleset, which matters: a bypass broad enough to permit the
+          # push might also let the merge skip the very check it is there to
+          # wait for.
+          seed() {
+            local tier="$1" pin="$2"
+            echo "=== seeding e2e/$tier at $pin ==="
+            git push origin --delete "e2e/$tier" --quiet 2>/dev/null || true
+            git checkout -B "e2e/$tier" origin/master --quiet
+            npm install --save-exact --package-lock-only --ignore-scripts --no-audit "$PACKAGE@$pin"
+            git add package.json package-lock.json
+            git commit --quiet -m "Seed e2e/$tier at $pin for run ${LATEST%%.*}"
+            git push --quiet origin "e2e/$tier"
+            echo "  e2e/$tier -> $(jq -r --arg p "$PACKAGE" '.dependencies[$p]' package.json)"
+          }
+
+          seed patch    "$PATCH_BASE"
+          seed minor    "$MINOR_BASE"
+          seed update   "$MINOR_BASE"
+          seed major    "$MAJOR_BASE"
+          seed nochange "$LATEST"
+
+  # ---------------------------------------------------------------------------
+  # The four single-pass tiers.
+  # ---------------------------------------------------------------------------
+  tier:
+    needs: reset
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    strategy:
+      fail-fast: false
+      matrix:
+        tier: [patch, minor, major, nochange]
+    env:
+      GH_TOKEN: ${{ secrets.E2E_TOKEN }}
+      TIER: ${{ matrix.tier }}
+      LATEST: ${{ needs.reset.outputs.latest }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: e2e/${{ matrix.tier }}
+
+      - name: Checkout the action under test
         uses: actions/checkout@v4
         with:
           repository: washogren/auto-update-dependencies
           ref: ${{ inputs.action-ref }}
           path: action
 
-      - uses: ./action
+      - name: Record the pin before the action runs
+        id: before
+        run: echo "pin=$(jq -r --arg p "$PACKAGE" '.dependencies[$p]' package.json)" >> "$GITHUB_OUTPUT"
+
+      # Identical config for every tier. This is the point of the test.
+      - id: act
+        uses: ./action
         with:
           package: '@washogren/am-dependency'
-          tag: dev
-          base-branch: dev
+          tag: e2e-${{ matrix.tier }}
+          base-branch: e2e/${{ matrix.tier }}
           npm-scope: '@washogren'
           token: ${{ secrets.E2E_TOKEN }}
+          auto-merge: true
+          auto-merge-when-semver: patch
+          create-pr-when-semver: patch, minor
+
+      - name: Assert the action's outputs
+        env:
+          CHANGED: ${{ steps.act.outputs.changed }}
+          CURRENT: ${{ steps.act.outputs.current }}
+          RESOLVED: ${{ steps.act.outputs.latest }}
+          SEMVER: ${{ steps.act.outputs.semver-change }}
+          SHOULD_CREATE: ${{ steps.act.outputs.should-create-pr }}
+          PR_NUMBER: ${{ steps.act.outputs.pr-number }}
+          PR_OP: ${{ steps.act.outputs.pr-operation }}
+          PIN_BEFORE: ${{ steps.before.outputs.pin }}
+        run: |
+          fail=0
+          expect() {
+            if [ "$2" != "$3" ]; then echo "::error::$1: expected '$3', got '$2'" >&2; fail=1;
+            else echo "  ok  $1 = $2"; fi
+          }
+
+          echo "outputs: changed=$CHANGED current=$CURRENT latest=$RESOLVED semver=$SEMVER should-create-pr=$SHOULD_CREATE op=$PR_OP pr=$PR_NUMBER"
+          expect "current" "$CURRENT" "$PIN_BEFORE"
+
+          case "$TIER" in
+            patch)
+              expect "changed" "$CHANGED" "true"
+              expect "latest" "$RESOLVED" "$LATEST"
+              expect "semver-change" "$SEMVER" "patch"
+              expect "should-create-pr" "$SHOULD_CREATE" "true"
+              expect "pr-operation" "$PR_OP" "created"
+              [ -n "$PR_NUMBER" ] || { echo "::error::pr-number is empty" >&2; fail=1; }
+              ;;
+            minor)
+              expect "changed" "$CHANGED" "true"
+              expect "latest" "$RESOLVED" "$LATEST"
+              expect "semver-change" "$SEMVER" "minor"
+              expect "should-create-pr" "$SHOULD_CREATE" "true"
+              expect "pr-operation" "$PR_OP" "created"
+              [ -n "$PR_NUMBER" ] || { echo "::error::pr-number is empty" >&2; fail=1; }
+              ;;
+            major)
+              expect "changed" "$CHANGED" "true"
+              expect "latest" "$RESOLVED" "$LATEST"
+              expect "semver-change" "$SEMVER" "major"
+              expect "should-create-pr" "$SHOULD_CREATE" "false"
+              expect "pr-number" "$PR_NUMBER" ""
+              ;;
+            nochange)
+              expect "changed" "$CHANGED" "false"
+              expect "latest" "$RESOLVED" "$LATEST"
+              # Never classified, so these are EMPTY rather than false.
+              expect "semver-change" "$SEMVER" ""
+              expect "should-create-pr" "$SHOULD_CREATE" ""
+              expect "pr-number" "$PR_NUMBER" ""
+              ;;
+          esac
+          exit "$fail"
+
+      # --- patch: must reach MERGED with nobody touching it ---
+      - name: Assert auto-merge was armed
+        if: matrix.tier == 'patch'
+        env:
+          PR_NUMBER: ${{ steps.act.outputs.pr-number }}
+        run: |
+          ARMED=$(gh pr view "$PR_NUMBER" --json autoMergeRequest --jq 'if .autoMergeRequest then "yes" else "no" end')
+          BODY=$(gh pr view "$PR_NUMBER" --json body --jq '.body')
+          fail=0
+          [ "$ARMED" = "yes" ] || { echo "::error::auto-merge was not armed on the patch tier" >&2; fail=1; }
+          echo "$BODY" | grep -q '^## PRs' || { echo "::error::changelog is missing the '## PRs' section" >&2; fail=1; }
+          echo "$BODY" | grep -q '^## Commits w/ no PR' || { echo "::error::changelog is missing the standalone-commits section" >&2; fail=1; }
+          exit "$fail"
+
+      - name: Assert the PR merges itself
+        if: matrix.tier == 'patch'
+        env:
+          PR_NUMBER: ${{ steps.act.outputs.pr-number }}
+        run: |
+          for _ in $(seq 1 60); do
+            STATE=$(gh pr view "$PR_NUMBER" --json state --jq '.state')
+            [ "$STATE" = "MERGED" ] && { echo "PR #$PR_NUMBER merged unattended"; break; }
+            [ "$STATE" = "CLOSED" ] && { echo "::error::PR #$PR_NUMBER was closed without merging" >&2; exit 1; }
+            sleep 10
+          done
+          STATE=$(gh pr view "$PR_NUMBER" --json state --jq '.state')
+          [ "$STATE" = "MERGED" ] || { echo "::error::PR #$PR_NUMBER never merged (state=$STATE)" >&2; exit 1; }
+          BRANCH="auto-update/washogren-am-dependency-e2e-patch"
+          if git ls-remote --exit-code --heads origin "$BRANCH" >/dev/null 2>&1; then
+            echo "::error::delete-branch did not remove $BRANCH" >&2; exit 1
+          fi
+          echo "head branch deleted"
+
+      # --- minor: must stay OPEN once its checks are green ---
+      - name: Assert auto-merge was withheld and the PR stays open
+        if: matrix.tier == 'minor'
+        env:
+          PR_NUMBER: ${{ steps.act.outputs.pr-number }}
+        run: |
+          ARMED=$(gh pr view "$PR_NUMBER" --json autoMergeRequest --jq 'if .autoMergeRequest then "yes" else "no" end')
+          [ "$ARMED" = "no" ] || { echo "::error::auto-merge was armed on a minor bump" >&2; exit 1; }
+
+          # Waiting for the checks to finish is what makes this meaningful:
+          # green-and-still-open is the only state that distinguishes "auto-merge
+          # was withheld" from "auto-merge simply has not fired yet".
+          echo "waiting for checks to register..."
+          for _ in $(seq 1 30); do
+            gh pr checks "$PR_NUMBER" >/dev/null 2>&1 && break
+            sleep 4
+          done
+          gh pr checks "$PR_NUMBER" --watch --fail-fast
+
+          STATE=$(gh pr view "$PR_NUMBER" --json state --jq '.state')
+          [ "$STATE" = "OPEN" ] || { echo "::error::minor PR is $STATE with green checks; it should still be OPEN" >&2; exit 1; }
+          echo "checks green and PR still OPEN — auto-merge correctly withheld"
+
+      - name: Merge the minor PR from the harness
+        if: matrix.tier == 'minor'
+        env:
+          PR_NUMBER: ${{ steps.act.outputs.pr-number }}
+        run: |
+          # Confirms it was mergeable all along — blocked by the gate, not broken.
+          gh pr merge "$PR_NUMBER" --squash --delete-branch
+          STATE=$(gh pr view "$PR_NUMBER" --json state --jq '.state')
+          [ "$STATE" = "MERGED" ] || { echo "::error::harness merge failed (state=$STATE)" >&2; exit 1; }
+
+      # --- major / nochange: assert ABSENCE, plus a positive side-effect ---
+      - name: Assert no PR and no branch were created
+        if: matrix.tier == 'major' || matrix.tier == 'nochange'
+        env:
+          PIN_BEFORE: ${{ steps.before.outputs.pin }}
+        run: |
+          fail=0
+          COUNT=$(gh pr list --state all --base "e2e/$TIER" --json number --jq 'length')
+          [ "$COUNT" = "0" ] || { echo "::error::$COUNT PR(s) exist against e2e/$TIER; expected none" >&2; fail=1; }
+
+          BRANCH="auto-update/washogren-am-dependency-e2e-$TIER"
+          if git ls-remote --exit-code --heads origin "$BRANCH" >/dev/null 2>&1; then
+            echo "::error::$BRANCH was created; expected none" >&2; fail=1
+          fi
+
+          # An absence assertion alone rots silently, so pair it with a positive
+          # one: the branch pin must be untouched. For the major tier that is the
+          # observable proof the run short-circuited BEFORE the install, not just
+          # that no PR appeared.
+          git fetch origin "e2e/$TIER" --quiet
+          PIN_AFTER=$(git show "origin/e2e/$TIER:package.json" | jq -r --arg p "$PACKAGE" '.dependencies[$p]')
+          [ "$PIN_AFTER" = "$PIN_BEFORE" ] || { echo "::error::pin changed from $PIN_BEFORE to $PIN_AFTER" >&2; fail=1; }
+          echo "  no PR, no branch, pin still $PIN_AFTER"
+          exit "$fail"
+
+  # ---------------------------------------------------------------------------
+  # The update tier: the only one that runs the action twice. Its dist-tag moves
+  # between passes, simulating a new release landing while a PR is still open.
+  # The failure this exists to catch is a SECOND PR appearing beside the first.
+  # ---------------------------------------------------------------------------
+  tier-update:
+    needs: reset
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    env:
+      GH_TOKEN: ${{ secrets.E2E_TOKEN }}
+      LATEST: ${{ needs.reset.outputs.latest }}
+      PATCH_BASE: ${{ needs.reset.outputs.patch_base }}
+      MINOR_BASE: ${{ needs.reset.outputs.minor_base }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: e2e/update
+
+      - name: Checkout the action under test
+        uses: actions/checkout@v4
+        with:
+          repository: washogren/auto-update-dependencies
+          ref: ${{ inputs.action-ref }}
+          path: action
+
+      # Pass 1 — the tag still resolves M.1.0, so this is a minor bump and the
+      # PR is deliberately NOT armed for auto-merge. That is what keeps it open
+      # for pass 2 by design rather than by luck.
+      - id: pass1
+        uses: ./action
+        with:
+          package: '@washogren/am-dependency'
+          tag: e2e-update
+          base-branch: e2e/update
+          npm-scope: '@washogren'
+          token: ${{ secrets.E2E_TOKEN }}
+          auto-merge: true
+          auto-merge-when-semver: patch
+          create-pr-when-semver: patch, minor
+
+      - name: Assert pass 1 created exactly one PR
+        env:
+          PR_NUMBER: ${{ steps.pass1.outputs.pr-number }}
+          PR_OP: ${{ steps.pass1.outputs.pr-operation }}
+          RESOLVED: ${{ steps.pass1.outputs.latest }}
+        run: |
+          fail=0
+          [ "$PR_OP" = "created" ] || { echo "::error::pass 1 pr-operation is '$PR_OP', expected 'created'" >&2; fail=1; }
+          [ "$RESOLVED" = "$PATCH_BASE" ] || { echo "::error::pass 1 resolved '$RESOLVED', expected '$PATCH_BASE'" >&2; fail=1; }
+          COUNT=$(gh pr list --state open --base e2e/update --json number --jq 'length')
+          [ "$COUNT" = "1" ] || { echo "::error::$COUNT open PRs against e2e/update after pass 1; expected 1" >&2; fail=1; }
+          echo "pass 1 opened PR #$PR_NUMBER targeting $PATCH_BASE"
+          exit "$fail"
+
+      - name: Advance the update tier's dist-tag
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.E2E_TOKEN }}
+        run: |
+          # Scope-bound only, never a global default — a global default makes the
+          # private registry authoritative for every package, so public deps 404.
+          # These keys are not valid shell identifiers (`@`, `:`, `/`), so they go
+          # in .npmrc rather than through `export`.
+          printf '@washogren:registry=%s\n' "$REGISTRY" > .npmrc
+          printf '//npm.pkg.github.com/:_authToken=%s\n' "$NODE_AUTH_TOKEN" >> .npmrc
+          npm dist-tag add "$PACKAGE@$LATEST" e2e-update
+          npm dist-tag ls "$PACKAGE" | grep '^e2e-update:'
+
+      # Pass 2 — the base branch still pins M.0.0 (the PR's changes live on the
+      # head branch), so this classifies as minor again and must UPDATE the
+      # existing PR rather than open a second one.
+      - id: pass2
+        uses: ./action
+        with:
+          package: '@washogren/am-dependency'
+          tag: e2e-update
+          base-branch: e2e/update
+          npm-scope: '@washogren'
+          token: ${{ secrets.E2E_TOKEN }}
+          auto-merge: true
+          auto-merge-when-semver: patch
+          create-pr-when-semver: patch, minor
+
+      - name: Assert pass 2 updated the SAME PR
+        env:
+          PR1: ${{ steps.pass1.outputs.pr-number }}
+          PR2: ${{ steps.pass2.outputs.pr-number }}
+          PR_OP: ${{ steps.pass2.outputs.pr-operation }}
+          CURRENT: ${{ steps.pass2.outputs.current }}
+          RESOLVED: ${{ steps.pass2.outputs.latest }}
+        run: |
+          fail=0
+          [ "$PR_OP" = "updated" ] || { echo "::error::pass 2 pr-operation is '$PR_OP', expected 'updated'" >&2; fail=1; }
+          [ "$PR2" = "$PR1" ] || { echo "::error::pass 2 touched PR #$PR2, expected the same PR #$PR1" >&2; fail=1; }
+          [ "$CURRENT" = "$MINOR_BASE" ] || { echo "::error::pass 2 current is '$CURRENT'; the base branch pin should be unchanged at '$MINOR_BASE'" >&2; fail=1; }
+          [ "$RESOLVED" = "$LATEST" ] || { echo "::error::pass 2 resolved '$RESOLVED', expected '$LATEST'" >&2; fail=1; }
+
+          # The regression this tier exists to catch.
+          COUNT=$(gh pr list --state open --base e2e/update --json number --jq 'length')
+          [ "$COUNT" = "1" ] || { echo "::error::$COUNT open PRs against e2e/update after pass 2; a second PR is the bug" >&2; fail=1; }
+
+          # Content must actually track the new version, not just the branch move.
+          TITLE=$(gh pr view "$PR1" --json title --jq '.title')
+          echo "$TITLE" | grep -q "$LATEST" || { echo "::error::PR title still reads '$TITLE'; expected it to name $LATEST" >&2; fail=1; }
+          HEAD_PIN=$(gh api "repos/{owner}/{repo}/contents/package.json?ref=auto-update/washogren-am-dependency-e2e-update" \
+            --jq '.content' | base64 -d | jq -r --arg p "$PACKAGE" '.dependencies[$p]')
+          [ "$HEAD_PIN" = "$LATEST" ] || { echo "::error::head branch pins '$HEAD_PIN', expected '$LATEST'" >&2; fail=1; }
+
+          echo "one PR (#$PR1), updated from $PATCH_BASE to $LATEST"
+          exit "$fail"
+
+      - name: Merge the update PR so its checks are proven green
+        env:
+          PR1: ${{ steps.pass1.outputs.pr-number }}
+        run: |
+          echo "waiting for checks to register..."
+          for _ in $(seq 1 30); do
+            gh pr checks "$PR1" >/dev/null 2>&1 && break
+            sleep 4
+          done
+          gh pr checks "$PR1" --watch --fail-fast
+          gh pr merge "$PR1" --squash --delete-branch
+          STATE=$(gh pr view "$PR1" --json state --jq '.state')
+          [ "$STATE" = "MERGED" ] || { echo "::error::update PR did not merge (state=$STATE)" >&2; exit 1; }
+
+  # ---------------------------------------------------------------------------
+  # The run succeeds only if every tier did.
+  # ---------------------------------------------------------------------------
+  verify:
+    needs: [reset, tier, tier-update]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require every tier to have passed
+        env:
+          TIERS: ${{ needs.tier.result }}
+          UPDATE: ${{ needs.tier-update.result }}
+          RESET: ${{ needs.reset.result }}
+        run: |
+          echo "reset=$RESET tiers=$TIERS update=$UPDATE"
+          {
+            echo "### E2E tier results"
+            echo
+            echo "| stage | result |"
+            echo "| --- | --- |"
+            echo "| reset + seed | $RESET |"
+            echo "| patch / minor / major / nochange | $TIERS |"
+            echo "| update | $UPDATE |"
+          } >> "$GITHUB_STEP_SUMMARY"
+          [ "$RESET" = "success" ] && [ "$TIERS" = "success" ] && [ "$UPDATE" = "success" ] || {
+            echo "::error::not every tier passed" >&2; exit 1; }
+          echo "all tiers passed"
